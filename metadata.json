@@ -1,0 +1,5 @@
+{
+  "name": "Cosmo",
+  "description": "Advanced video analysis tool with timeline snapshots, AI-powered reviewer scripts, and persistent history.",
+  "requestFramePermissions": []
+}
