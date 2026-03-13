@@ -9,9 +9,15 @@ import multer from "multer";
 import Database from "better-sqlite3";
 import ffmpeg from "fluent-ffmpeg";
 import { GoogleGenAI, Type, GenerateContentResponse } from "@google/genai";
+import { createClient } from "@supabase/supabase-js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+
+// Supabase Configuration
+const supabaseUrl = process.env.VITE_SUPABASE_URL || "";
+const supabaseServiceKey = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.VITE_SUPABASE_ANON_KEY || "";
+const supabase = createClient(supabaseUrl, supabaseServiceKey);
 
 // Ensure upload directories exist
 const UPLOADS_DIR = path.join(__dirname, "uploads");
@@ -195,9 +201,11 @@ const responseSchema = {
   required: ["video_title", "duration_estimate", "overview", "timeline", "strengths", "issues", "distribution_logic", "recommendations"],
 };
 
-// Helper: Extract snapshot
-async function extractSnapshot(videoPath: string, time: number, outputName: string): Promise<string> {
-  return new Promise((resolve, reject) => {
+// Helper: Extract snapshot and upload to Supabase
+async function extractSnapshotAndUpload(videoPath: string, time: number, outputName: string): Promise<string> {
+  const localSnapshotPath = path.join(SNAPSHOTS_DIR, outputName);
+  
+  await new Promise((resolve, reject) => {
     ffmpeg(videoPath)
       .screenshots({
         timestamps: [time],
@@ -205,9 +213,23 @@ async function extractSnapshot(videoPath: string, time: number, outputName: stri
         folder: SNAPSHOTS_DIR,
         size: "640x?",
       })
-      .on("end", () => resolve(`/uploads/snapshots/${outputName}`))
+      .on("end", resolve)
       .on("error", (err) => reject(err));
   });
+
+  const fileBuffer = await fs.readFile(localSnapshotPath);
+  const { data, error } = await supabase.storage
+    .from('snapshots')
+    .upload(outputName, fileBuffer, { contentType: 'image/jpeg', upsert: true });
+
+  if (error) throw error;
+
+  const { data: { publicUrl } } = supabase.storage.from('snapshots').getPublicUrl(outputName);
+  
+  // Clean up local snapshot
+  await fs.unlink(localSnapshotPath).catch(console.error);
+  
+  return publicUrl;
 }
 
 // API: Analyze Video
@@ -246,6 +268,18 @@ app.post("/api/analyze", (req, res) => {
       const videoBuffer = await fs.readFile(videoPath);
       const base64Video = videoBuffer.toString("base64");
 
+      // Upload video to Supabase Storage
+      const { data: uploadData, error: uploadError } = await supabase.storage
+        .from('videos')
+        .upload(req.file.filename, videoBuffer, { contentType: req.file.mimetype, upsert: true });
+
+      if (uploadError) {
+        console.error("Supabase Video Upload Error:", uploadError);
+        // Continue anyway as we have the buffer for AI analysis
+      }
+
+      const { data: { publicUrl: videoPublicUrl } } = supabase.storage.from('videos').getPublicUrl(req.file.filename);
+
       const response = await withRetry(() => ai.models.generateContent({
         model: "gemini-3-flash-preview",
         contents: [
@@ -268,7 +302,7 @@ app.post("/api/analyze", (req, res) => {
       })) as GenerateContentResponse;
 
       const analysis = JSON.parse(response.text);
-      const snapshots: string[] = [];
+      const outputSnapshots: string[] = [];
 
       // Extract snapshots for each timeline segment
       for (let i = 0; i < analysis.timeline.length; i++) {
@@ -277,20 +311,20 @@ app.post("/api/analyze", (req, res) => {
         
         const snapshotName = `${req.file.filename}-segment-${i}.jpg`;
         try {
-          const snapshotUrl = await extractSnapshot(videoPath, midTime, snapshotName);
+          const snapshotUrl = await extractSnapshotAndUpload(videoPath, midTime, snapshotName);
           segment.snapshotUrl = snapshotUrl;
-          snapshots.push(snapshotUrl);
+          outputSnapshots.push(snapshotUrl);
         } catch (err) {
           console.error(`Failed to extract snapshot for segment ${i}:`, err);
         }
       }
 
-      // Save to history
+      // Save to history (Local DB for fallback, but primary is Supabase via Frontend)
       const id = Math.random().toString(36).substring(7);
       db.prepare("INSERT INTO history (id, name, filename, analysis, snapshots) VALUES (?, ?, ?, ?, ?)")
-        .run(id, req.file.originalname, req.file.filename, JSON.stringify(analysis), JSON.stringify(snapshots));
+        .run(id, req.file.originalname, videoPublicUrl, JSON.stringify(analysis), JSON.stringify(outputSnapshots));
 
-      res.json({ id, name: req.file.originalname, filename: req.file.filename, analysis, snapshots });
+      res.json({ id, name: req.file.originalname, filename: videoPublicUrl, analysis, snapshots: outputSnapshots });
     } catch (error) {
       console.error("Analysis failed:", error);
       const err = error as { message?: string; status?: number };
