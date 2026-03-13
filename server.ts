@@ -1,6 +1,5 @@
 import express from "express";
 import "dotenv/config";
-import { createServer as createViteServer, ViteDevServer } from "vite";
 import path from "path";
 import { fileURLToPath } from "url";
 import fs from "fs/promises";
@@ -497,8 +496,9 @@ app.get("/api/history/:id", (req, res) => {
 
 async function startServer() {
   // Vite middleware for development
-  let vite: ViteDevServer | undefined;
+  let vite: any;
   if (process.env.NODE_ENV !== "production") {
+    const { createServer: createViteServer } = await import("vite");
     vite = await createViteServer({
       server: { middlewareMode: true },
       appType: "spa",
